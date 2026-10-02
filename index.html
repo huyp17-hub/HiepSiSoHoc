@@ -1875,7 +1875,17 @@ const Net = (() => {
     },
     leaderboard(stageId){ return rpc("get_leaderboard", { p_stage:stageId || null, p_limit:10 }); },
     async recoveryCode(){ if (!profileOk) await ensureProfile(); return rpc("get_recovery_code"); },
-    restore(code){ return rpc("restore_from_code", { p_code:code }); }
+    restore(code){ return rpc("restore_from_code", { p_code:code }); },
+    // The question bank is public: no sign-in needed, 8 second timeout
+    async fetchQuestions(){
+      if (!enabled) return null;
+      try {
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000));
+        const { data, error } = await Promise.race([client().rpc("get_questions"), timeout]);
+        if (error) throw error;
+        return data;
+      } catch(e){ console.warn("Không tải được đề từ máy chủ:", e && e.message || e); return null; }
+    }
   };
 })();
 // Turn server errors into short Vietnamese messages
@@ -1944,12 +1954,16 @@ const reduceMotion = () => { try { return matchMedia("(prefers-reduced-motion: r
 const starsHtml = n => `<span class="stars" aria-label="${n} trên 3 sao">${[0,1,2].map(i => `<i class="star ${i<n?"on":""}"></i>`).join("")}</span>`;
 
 const STAGES = [];
-QUESTIONS.forEach(q => {
-  let s = STAGES.find(x => x.id === q.stageId);
-  if (!s) { s = {id:q.stageId, name:cleanName(q.stageName), questions:[]}; STAGES.push(s); }
-  s.questions.push(q);
-});
-STAGES.sort((a,b) => a.id.localeCompare(b.id));
+function rebuildStages(){
+  STAGES.length = 0;
+  QUESTIONS.forEach(q => {
+    let s = STAGES.find(x => x.id === q.stageId);
+    if (!s) { s = {id:q.stageId, name:cleanName(q.stageName), order:q.stageOrder ?? 0, questions:[]}; STAGES.push(s); }
+    s.questions.push(q);
+  });
+  STAGES.sort((a,b) => (a.order - b.order) || a.id.localeCompare(b.id));
+}
+rebuildStages();
 const info = id => STAGE_INFO[id] || STAGE_INFO.stage_1;
 
 // ---------- save data ----------
@@ -1983,6 +1997,31 @@ function hitDmg(){
   return Math.max(5, base - shieldBlock());
 }
 const QMAP = Object.fromEntries(QUESTIONS.map(q => [q.id, q]));
+// ---- question bank: server -> cached copy -> built-in ----
+const BANK_KEY = "hsh_bank_v1";
+let bankSource = "có sẵn trong game", pendingBank = null;
+function validBank(list){
+  return Array.isArray(list) ? list.filter(q => q && q.id && q.stageId && q.question && Array.isArray(q.options) && q.options.length === 4
+    && Number.isInteger(q.correctIndex) && q.correctIndex >= 0 && q.correctIndex < 4 && (q.type !== "input" || (q.answerKind && q.answer))) : [];
+}
+function applyBank(list, source){
+  const ok = validBank(list); if (!ok.length) return false;
+  if (!["title", "map", "classselect", "lb"].includes(screen)) { pendingBank = {list:ok, source}; return true; }
+  QUESTIONS.splice(0, QUESTIONS.length, ...ok);
+  Object.keys(QMAP).forEach(k => delete QMAP[k]); ok.forEach(q => QMAP[q.id] = q);
+  rebuildStages(); bankSource = source; pendingBank = null;
+  save.unlocked = Math.min(Math.max(1, save.unlocked), STAGES.length);
+  const el = document.getElementById("bankStatus"); if (el) el.textContent = bankStatusText();
+  if (screen === "map") renderMap();
+  return true;
+}
+function bankStatusText(){ return `Ngân hàng đề: ${QUESTIONS.length} câu (${bankSource}).`; }
+async function loadBank(){
+  const cached = store.get(BANK_KEY, null);
+  if (cached && cached.list) applyBank(cached.list, "bản lưu lần trước");
+  const fresh = await Net.fetchQuestions();
+  if (fresh && validBank(fresh).length) { store.set(BANK_KEY, {at:Date.now(), list:fresh}); applyBank(fresh, "máy chủ"); }
+}
 const diff = q => q.difficulty || 2;
 const isInput = q => q.type === "input" && !!q.answerKind;
 const FILL_KEYS = {
@@ -2173,6 +2212,7 @@ function renderTitle(){
         <div class="row center-row">${soundBtn()}
           ${Net.enabled ? `<button class="icon-btn" id="restoreBtn">Có mã khôi phục?</button>` : ""}</div>
         <p class="netstatus" id="netStatus">${netStatusText()}</p>
+        <p class="netstatus" id="bankStatus">${bankStatusText()}</p>
         <p class="credit">Đồ họa: Tiny Dungeon của Kenney (kenney.nl, CC0). Nhạc và âm thanh tổng hợp bằng trình duyệt.</p>
       </div>
     </section>`;
@@ -2237,6 +2277,7 @@ function hudStats(){
 let mapTab = "adventure";
 function renderMap(tab){
   if (tab) mapTab = tab;
+  if (pendingBank) { const p = pendingBank; pendingBank = null; screen = "map"; applyBank(p.list, p.source); }
   screen = "map"; stopLoop(); Sound.music("explore");
   const nb = Object.keys(save.notebook).filter(id => QMAP[id]);
   const tabs = [["adventure","Phiêu lưu"],["duel","Đấu Solo"],["hero","Nhân vật"],["practice","Luyện tập"],["notebook",`Sổ tay lỗi sai (${nb.length})`],["shop","Cửa hàng"]];
@@ -2379,7 +2420,7 @@ function shopTab(){
       <div class="shopkeeper-row">${spr(112,"s4")}<p><b>Lữ khách:</b> "Hàng tốt đây, hiệp sĩ! Đánh quái kiếm vàng rồi quay lại nhé."</p></div>
       <h3 class="shoph">Vật phẩm</h3>
       ${item("potion", T.potionRed, "Bình máu", `Hồi ${POTION_HEAL} máu giữa trận. Đang có ${save.potions}.`, POTION_PRICE, false, cant(POTION_PRICE))}
-      ${item("elixir", T.potionGreen, "Thuốc sáng suốt", `Loại bỏ 2 đáp án sai của câu đang làm. Đang có ${save.elixirs}.`, ELIXIR_PRICE, false, cant(ELIXIR_PRICE))}
+      ${item("elixir", T.potionGreen, "Thuốc gợi ý", `Hiện gợi ý cho câu đang làm trong trận. Đang có ${save.elixirs}.`, ELIXIR_PRICE, false, cant(ELIXIR_PRICE))}
       <h3 class="shoph">Trang bị</h3>
       ${curSword ? item("", curSword.sprite, curSword.name, `+${curSword.bonus} sát thương mỗi đòn. Kỵ sĩ dùng kiếm, rìu; pháp sư dùng trượng.`, 0, true) : ""}
       ${nextSword ? item("sword", nextSword.sprite, nextSword.name, `+${nextSword.bonus} sát thương mỗi đòn. Kỵ sĩ dùng kiếm, rìu; pháp sư dùng trượng.`, nextSword.price, false, cant(nextSword.price)) : ""}
@@ -2649,7 +2690,7 @@ async function openChest(c){
   if (elixir) save.elixirs++; else save.potions++;
   save.gold += gold; persist();
   await say({sprite: elixir ? T.potionGreen : T.potionRed, name:"Rương báu",
-    text: elixir ? `Bạn nhặt được 1 thuốc sáng suốt và ${gold} vàng! Thuốc giúp loại bỏ 2 đáp án sai trong trận.`
+    text: elixir ? `Bạn nhặt được 1 thuốc gợi ý và ${gold} vàng! Uống trong trận để xem gợi ý của câu đang làm.`
                  : `Bạn nhặt được 1 bình máu và ${gold} vàng! Bình máu có thể uống ngay giữa trận để hồi ${POTION_HEAL} máu.`});
   RUN.busy = false; renderRoomHudOnly();
 }
@@ -2711,7 +2752,7 @@ function startBattle(enemy, ambush, practice){
       await say([
         {...SAGE, text:"Mỗi lượt, một câu hỏi sẽ hiện ra. Trả lời đúng thì hiệp sĩ chém quái, trả lời sai thì quái đánh trả."},
         {...SAGE, text:"Trả lời trong 30 giây đầu được thêm 50% điểm. Đúng liên tiếp nhiều câu sẽ tung đòn chí mạng!"},
-        {...SAGE, text:`Mỗi trận bạn được dùng kỹ năng ${heroCls().skill} một lần. Nếu máu yếu, bấm Bình máu; gặp câu khó thì dùng Thuốc sáng suốt. Chúc may mắn!`}
+        {...SAGE, text:`Mỗi trận bạn được dùng kỹ năng ${heroCls().skill} một lần. Nếu máu yếu, bấm Bình máu; gặp câu khó thì uống Thuốc gợi ý màu xanh để xem gợi ý. Chúc may mắn!`}
       ]);
       save.tutorial = true; persist();
     }
@@ -2741,7 +2782,7 @@ function refreshBattle(){
   document.getElementById("combo").textContent = B.combo >= 2 ? `Chuỗi ${B.combo} đòn! Nhát kế tiếp là đòn chí mạng` : "";
   const canPotion = B.ready && !B.answered && !B.practice && save.potions > 0 && RUN.hp < maxHp();
   const fillMode = isInput(q) && !B.mc;
-  const canElixir = B.ready && !B.answered && !B.practice && save.elixirs > 0 && !B.elixirUsed && (fillMode || B.elim.length < 2) && q.options.length === 4;
+  const canElixir = B.ready && !B.answered && !B.practice && save.elixirs > 0 && !B.hintUsed && !!q.hint;
   const canSkill = B.ready && !B.answered && !B.practice && !B.skillUsed && (save.cls !== "mage" || (fillMode ? !B.reveal : B.elim.length < 2));
   document.getElementById("qslot").innerHTML = !B.ready ? `<article class="qpanel px waiting"><p>Chuẩn bị chiến đấu...</p></article>` : `
     <article class="qpanel px">
@@ -2758,14 +2799,13 @@ function refreshBattle(){
         }).join("")}
       </div>`}
       ${B.reveal ? `<div class="hintbox">${spr(130,"s2")}<span>${esc(B.reveal)}</span></div>` : ""}
-      ${B.hintUsed && q.hint ? `<div class="hintbox">${spr(T.potionBlue,"s2")}<span>${math(q.hint)}</span></div>` : ""}
+      ${B.hintUsed && q.hint ? `<div class="hintbox">${spr(T.potionGreen,"s2")}<span>${math(q.hint)}</span></div>` : ""}
       ${B.answered && B.picked === q.correctIndex ? `<div class="feedback">${B.crit ? "Chí mạng! " : "Chính xác! "}+${B.lastGain} điểm, gây ${B.lastDmg} sát thương</div>` : ""}
       <div class="below">
         ${!B.answered
           ? `<div class="row">
-               <button class="btn ghost" id="hint" ${B.hintUsed||!q.hint?"disabled":""}>Gợi ý</button>
-               ${B.practice ? "" : `<button class="btn ghost potion" id="potion" ${canPotion?"":"disabled"}>${spr(T.potionRed,"s2")}Bình máu (${save.potions})</button>
-               <button class="btn ghost potion" id="elixir" ${canElixir?"":"disabled"}>${spr(T.potionGreen,"s2")}${fillMode ? "Hiện lựa chọn" : "Loại 2"} (${save.elixirs})</button>
+               ${B.practice ? `<button class="btn ghost" id="hint" ${B.hintUsed||!q.hint?"disabled":""}>Gợi ý</button>` : `<button class="btn ghost potion" id="potion" ${canPotion?"":"disabled"}>${spr(T.potionRed,"s2")}Bình máu (${save.potions})</button>
+               <button class="btn ghost potion" id="elixir" ${canElixir?"":"disabled"} title="${q.hint ? "" : "Câu này không có gợi ý"}">${spr(T.potionGreen,"s2")}Gợi ý (${save.elixirs})</button>
                <button class="btn ghost potion skill ${B.shieldOn ? "active" : ""}" id="skill" ${canSkill?"":"disabled"}>${spr(heroCls().skillIcon,"s2")}${B.shieldOn ? "Khiên đang bật" : heroCls().skill}</button>`}
              </div>
              <span class="note">${B.practice ? "Chế độ luyện tập: sai không mất máu" : (B.hintUsed || B.noBonus) ? "Đã dùng trợ giúp nên không có thưởng tốc độ" : "Trả lời trong 30 giây đầu được x1.5 điểm"}</span>`
@@ -2815,16 +2855,14 @@ function useSkill(){
   }
   refreshBattle();
 }
+// Green potion: reveals the hint of the current question (no speed bonus afterwards)
 function useElixir(){
   const q = B.queue[B.idx];
-  if (!B.ready || B.answered || B.practice || save.elixirs <= 0 || B.elixirUsed) return;
-  if (!(isInput(q) && !B.mc) && B.elim.length >= 2) return;
-  save.elixirs--; persist(); B.elixirUsed = true;
-  if (isInput(q) && !B.mc) { B.mc = true; B.noBonus = true; Sound.play("heal"); return refreshBattle(); }
-  const wrongs = shuffle(q.options.map((_, i) => i).filter(i => i !== q.correctIndex));
-  B.elim = B.elim.concat(wrongs.filter(i => !B.elim.includes(i))).slice(0, 2);
-  B.noBonus = true; // no speed bonus when using help
+  if (!B.ready || B.answered || B.practice || save.elixirs <= 0 || B.hintUsed || !q.hint) return;
+  save.elixirs--; persist();
+  B.hintUsed = true;
   Sound.play("heal"); refreshBattle();
+  popText(document.getElementById("player"), "Gợi ý!", "heal");
 }
 function drinkPotion(){
   if (!B.ready || B.answered || save.potions <= 0 || RUN.hp >= maxHp()) return;
@@ -3451,7 +3489,7 @@ document.addEventListener("keydown", e => {
     const cq = B.queue[B.idx], fillMode = isInput(cq) && !B.mc;
     if (fillMode && !B.answered) { const el = document.getElementById("ans"); if (el && e.key.length === 1 && FILL_ALLOWED[cq.answerKind].test(e.key)) { el.focus(); } return; }
     if (!B.answered && k in map && map[k] < cq.options.length) { e.preventDefault(); answer(map[k]); }
-    else if (!B.answered && k === "h") document.getElementById("hint")?.click();
+    else if (!B.answered && k === "h") { if (B.practice) document.getElementById("hint")?.click(); else useElixir(); }
     else if (!B.answered && k === "p") drinkPotion();
     else if (!B.answered && k === "e") useElixir();
     else if (!B.answered && k === "k") useSkill();
@@ -3461,6 +3499,7 @@ document.addEventListener("pointerdown", () => Sound.init(), {once:true});
 
 if (SHEET_IMG.complete && SHEET_IMG.naturalWidth) renderTitle(); else SHEET_IMG.addEventListener("load", renderTitle, {once:true});
 Net.start();
+loadBank();
 
 </script>
 </body>
